@@ -1,29 +1,34 @@
 import gymnasium as gym
 import numpy as np
+import copy
 from typing import Any, Optional
 import logging
 import matplotlib.pyplot as plt
 from HawkesRLTrading.src.SimulationEntities.GymTradingAgent import GymTradingAgent, RandomGymTradingAgent
 from HawkesRLTrading.src.SimulationEntities.MetaOrderTradingAgents import TWAPGymTradingAgent
 from HawkesRLTrading.src.SimulationEntities.ImpulseControlAgent import ImpulseControlAgent
+from HawkesRLTrading.src.SimulationEntities.ICRLAgent import ICRLAgent, ICRL2, ICRLSG, PPOAgent
 from HawkesRLTrading.src.SimulationEntities.DiscreteSACGymAgent import DiscreteSACGymTradingAgent
 from HawkesRLTrading.src.Stochastic_Processes.Arrival_Models import ArrivalModel, HawkesArrival
 from HawkesRLTrading.src.SimulationEntities.Exchange import Exchange
 from HawkesRLTrading.src.Kernel import Kernel
+from HJBQVI.utils import TrainingLogger, ModelManager, get_gpu_specs
 import pickle
-from gymnasium.spaces import Discrete, Dict, Box
-logger=logging.getLogger(__name__)
+logging.basicConfig()
+logging.getLogger(__name__).setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 class tradingEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array", "text"], "render_fps": 4}
-    
-    def __init__(self, render_mode="text", stop_time: int=100, wall_time_limit: int=300, seed=1, log_to_file=True,**kwargs):
+
+    def __init__(self, render_mode="text", stop_time: int=100, wall_time_limit: int=300, kernel_name: str="Alpha", seed=1, log_to_file=True,**kwargs):
         """
         Initiates a trading environment. Arrivalmodel contains the simulation of the trading orders and params contains all other relevant information
         Relevant arguments:
         render_mode
         stop_time: simulation stop time in simulationseconds
         wall_time_limit: simulation wall time limit (Currently not implemented)
+        kernel_name: for human readability
         seed
         log_to_file
         kwargs -- Simulation default parameters specified as following format:
@@ -38,6 +43,7 @@ class tradingEnv(gym.Env):
                                     "log_to_file": True,
                                     "cashlimit": 500000, 
                                     "inventorylimit": 1000000,
+
                                     "wake_on_MO": True,
                                     "wake_on_Spread": False}],
                 # "GymTradingAgent": [{"cash": 1000000,
@@ -110,17 +116,19 @@ class tradingEnv(gym.Env):
                 new_agent=None
                 if j["strategy"]=="Random":
                     new_agent=RandomGymTradingAgent(seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], action_freq=j["action_freq"] , wake_on_MO=j["wake_on_MO"], wake_on_Spread=j["wake_on_Spread"], rewardpenalty=j["rewardpenalty"], cashlimit=j["cashlimit"], inventorylimit=j["inventorylimit"])
-                # if j["strategy"]=="Random":
-                #     new_agent=RandomGymTradingAgent(seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], action_freq=j["action_freq"] , rewardpenalty=j["rewardpenalty"], on_trade=j['on_trade'], cashlimit=j["cashlimit"])
                 elif j["strategy"] == "TWAP":
                     new_agent = TWAPGymTradingAgent(seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], cashlimit=j["cashlimit"], action_freq=j["action_freq"], total_order_size = j["total_order_size"], total_time = j["total_time"], window_size = j["window_size"], side = j["side"], order_target = j["order_target"], on_trade=j["on_trade"])
+                elif j["strategy"]=="Random":
+                    new_agent=RandomGymTradingAgent(seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], action_freq=j["action_freq"] , rewardpenalty=j["rewardpenalty"],  wake_on_MO=j["wake_on_MO"], wake_on_Spread=j["wake_on_Spread"], cashlimit=j["cashlimit"])
                 elif j['strategy'] == 'ImpulseControl':
                     new_agent = ImpulseControlAgent(j['label'], j['epoch'], j['model_dir'], seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], action_freq=j["action_freq"],
-                                                    on_trade=j['on_trade'], cashlimit=j["cashlimit"])
+                                                    wake_on_MO=j["wake_on_MO"], wake_on_Spread=j["wake_on_Spread"], cashlimit=j["cashlimit"])
+                elif j['strategy'] == 'ICRL':
+                    new_agent = j['agent_instance']
                 elif j['strategy'] =="DiscreteSAC":
                     new_agent=DiscreteSACGymTradingAgent(seed=self.seed, log_events=True, log_to_file=log_to_file, strategy=j["strategy"], Inventory=j["Inventory"], cash=j["cash"], action_freq=j["action_freq"] , wake_on_MO=j["wake_on_MO"], wake_on_Spread=j["wake_on_Spread"], rewardpenalty=j["rewardpenalty"], cashlimit=j["cashlimit"], inventorylimit=j["inventorylimit"], hyperparameter_config=j['hyperparameter_config'])
                 else:
-                    raise Exception("Program only supports RandomGymTrading Agents for now")      
+                    raise Exception("Program only supports RandomGymTrading Agents for now")
                 self.agents.append(new_agent)
         print("Agent IDs: " + str([agent.id for agent in self.agents]))
         #Arrival Model setup
@@ -134,15 +142,15 @@ class tradingEnv(gym.Env):
         else:
             raise ValueError("Please specify Arrival model for exchange")
 
-        self.kernel=Kernel(agents=self.agents, exchange=exchange, seed=seed, stop_time=self.stop_time, wall_time_limit=self.wall_time_limit, log_to_file=self.log_to_file, Arrival_model=Arrival_model)
+        self.kernel=Kernel(agents=self.agents, exchange=exchange, seed=seed, kernel_name=kernel_name, stop_time=stop_time, wall_time_limit=wall_time_limit, log_to_file=log_to_file, Arrival_model=Arrival_model)
         self.kernel.initialize_kernel()
         np.random.seed(self.seed)
-            
+
     def step(self, action: Optional[Any]):
         """
         Wrapper for state step -- a step ends when the next trade happens or when tau seconds have passed by, whichever occurs first for the agent
         Input: Action
-        Output: Observations, Rewards, termination, truncation, Logging info+metrics 
+        Output: Observations, Rewards, termination, truncation, Logging info+metrics
         """
         #Observations=cash, inventory, LOB state, current positions
         simstate=self.kernel.run(action=action)
@@ -190,7 +198,7 @@ class tradingEnv(gym.Env):
         Render an environment
         """
         pass
-    
+
     def close(self):
         """
         close any active running windows/tasks
@@ -228,18 +236,54 @@ class tradingEnv(gym.Env):
         rewards={}
         for gymagent in self.kernel.gymagents:
             rewards[gymagent.id]=gymagent.calculaterewards()
-        return rewards        
+        return rewards
     def istruncated(self):
-        return all(self.kernel.istruncated())
+        return len(self.kernel.istruncated()) > 0
     def isterminated(self):
-        return self.kernel.isterminated()  
+        return self.kernel.isterminated()
     def getinfo(self):
         """
-        Returns auxiliary info: 
+        Returns auxiliary info:
         """
         return {}
     def getAgent(self, ID):
         return self.kernel.entity_registry[ID]
+
+def preprocessdata(kernelparams):
+    """Takes in params and todpath and spits out corresponding vectorised numpy arrays
+
+    Returns:
+    tod: a [12, 13] matrix containing values of f(Q_t), the time multiplier for the 13 different 30 min bins of the trading day.
+    params=[kernelparams, baselines]
+        kernelparams=params[0]: an array of [12, 12] matrices consisting of mask, alpha0, beta, gamma. the item at arr[i][j] corresponds to the corresponding value from params[cols[i] + "->" + cols[j]]
+        So mask=params[0][0], alpha0=params[0][1], beta=params[0][2], gamma=params[0][3]
+        baselines=params[1]: a vector of dim=(num_nodes, 1) consisting of baseline intensities
+    """
+
+    cols = ["lo_deep_Ask", "co_deep_Ask", "lo_top_Ask","co_top_Ask", "mo_Ask", "lo_inspread_Ask" ,
+            "lo_inspread_Bid" , "mo_Bid", "co_top_Bid", "lo_top_Bid", "co_deep_Bid","lo_deep_Bid" ]
+    num_nodes = len(cols)
+
+
+    baselines=np.zeros(shape=(num_nodes, 1)) #vectorising baselines
+    for i in range(num_nodes):
+        baselines[i]=kernelparams[cols[i]]
+        #baselines[i]=data.pop(cols[i], None)
+
+
+    #params=[mask, alpha, beta, gamma] where each is a 12x12 matrix
+    mask, alpha, beta, gamma=[np.zeros(shape=(12, 12)) for _ in range(4)]
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            kernelParams = kernelparams.get(cols[i] + "->" + cols[j], None)
+            if kernelParams is not None:
+                mask[i][j]=kernelParams[0]
+                alpha[i][j]=kernelParams[1][0]
+                beta[i][j]=kernelParams[1][1]
+                gamma[i][j]=kernelParams[1][2]
+    kernelparams=[mask, alpha, beta, gamma]
+    params=[kernelparams, baselines]
+    return  params
 
 if __name__=="__main__":
     kwargs={
@@ -308,12 +352,15 @@ if __name__=="__main__":
     logger.debug(f"\nSimstate: {Simstate}\nObservations: {observations}\nRewards: {rewards}\nTermination: {termination}")
     i=0
     cash, inventory, t, actions = [], [], [], []
-    while Simstate["Done"]==False and termination!=True:
-        logger.debug(f"ENV TERMINATION: {termination}")
+    avgEpisodicRewards, stdEpisodicRewards, finalcash =[],[],[]
+    train_logger = TrainingLogger(layer_widths=layer_widths, n_layers=n_layers, log_dir=log_dir, label = label)
+    # model_manager = ModelManager(model_dir = model_dir, label = label)
+    for episode in range(500):
+        env=tradingEnv(stop_time=20, wall_time_limit=23400, seed=1, **kwargs)
+        print("Initial Observations"+ str(env.getobservations()))
+
+        Simstate, observations, termination, truncation =env.step(action=None)
         AgentsIDs=[k for k,v in Simstate["Infos"].items() if v==True]
-        print(f"Agents with IDs {AgentsIDs} have an action available")
-        if len(AgentsIDs)>1:
-            raise Exception("Code should be unreachable: Multiple gym agents are not yet implemented")
         agent: GymTradingAgent=env.getAgent(ID=AgentsIDs[0])
         assert isinstance(agent, GymTradingAgent), "Agent with action should be a GymTradingAgent"
         keys=["Inventory", "Spread", "Trend_var"]
