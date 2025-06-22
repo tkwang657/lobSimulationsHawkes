@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Tuple, ClassVar, List, Dict
 import pandas as pd
 import logging
-from copy import copy, deepcopy
+import copy
 from HawkesRLTrading.src.Utils.logging_config import *
 from HawkesRLTrading.src.Orders import *
 from HawkesRLTrading.src.Messages.Message import *
@@ -43,12 +43,11 @@ class TradingAgent(Entity):
         inventorylimit: total inventory limit ( a truncation condition)
         cash: starting cash level
         """
-    def __init__(self, seed=1, log_events: bool = True, log_to_file: bool = False, strategy: str= "Random", Inventory: Optional[Dict[str, Any]]=None, cash: int=5000, action_freq: float =0.5, wake_on_MO: bool=True,wake_on_Spread=True, cashlimit=1000000, inventorylimit=100000, start_trading_lag = 0) -> None:
+    def __init__(self, seed=1, log_events: bool = True, log_to_file: bool = False, strategy: str= "Random", Inventory: Optional[Dict[str, Any]]=None, cash: int=5000, action_freq: float =0.5, wake_on_MO: bool=True,wake_on_Spread=True, cashlimit=1000000, inventorylimit=100000, start_trading_lag = 0, truncation_enabled=True) -> None:
         super().__init__(type="TradingAgent", seed=seed, log_events=log_events, log_to_file=log_to_file)
         self.strategy=strategy #string that describes what strategy the agent has
         assert Inventory is not None, f"Agent needs inventory for initialisation"
-        self.startstate={"Inventory": Inventory, "cash": cash}
-        self.Inventory=self.startstate["Inventory"].copy() #Dictionary of how many shares the agent is holding
+        self.Inventory=Inventory #Dictionary of how many shares the agent is holding
         self.action_freq=action_freq
         #What trades is this agent notified to wakeup to
         self.wake_on_MO=wake_on_MO #Does this agent get notified to make a trade whenever a trade happens
@@ -59,11 +58,12 @@ class TradingAgent(Entity):
         #Truncation conditions
         self.cashlimit=cashlimit
         self.inventorylimit=inventorylimit
+        self.truncation_enabled = truncation_enabled
         self.cash=cash
         self.mid = 0
         #private atributes
         self.profit=0
-        self.statelog=[(0, self.cash, self.profit, copy(Inventory), deepcopy(self.positions))] #List of [timecode, cash, #realized profit, inventory, positions]
+        self.statelog=[(0, self.cash, self.profit, Inventory.copy(), self.positions.copy(), self.mid)] #List of [timecode, cash, #realized profit, inventory, positions]
         self.actions=["lo_deep_Ask", "co_deep_Ask", "lo_top_Ask","co_top_Ask", "mo_Ask", "lo_inspread_Ask" ,
             "lo_inspread_Bid" , "mo_Bid", "co_top_Bid", "lo_top_Bid", "co_deep_Bid","lo_deep_Bid", None]
         self.actionsToLevels = {
@@ -81,9 +81,9 @@ class TradingAgent(Entity):
             "lo_inspread_Bid": "Bid_inspread"
         }
         # Simulation attributes
-        
         self.exchange=None
         self.istruncated=False
+        
         #What time does the agent think it is?
         self.current_time: int = 0
         
@@ -96,6 +96,7 @@ class TradingAgent(Entity):
         for key in self.exchange.levels:
             self.positions[self.exchange.symbol][key]=[]
         wakeuptime=self.start_trading_lag+self.current_time + self.action_freq
+        self.first_wakeup_time = wakeuptime
         logger.debug(f"{type(self).__name__} {self.id} requesting kernel wakeup at time {wakeuptime}")
         self.set_wakeup(requested_time= wakeuptime)
         
@@ -243,13 +244,7 @@ class TradingAgent(Entity):
                 self.positions[message.order.symbol][level]+=[message.order]
                 logger.debug(f"Agent new state: {self.statelog[-1]}")
         elif isinstance(message, WakeAgentMsg):
-            #Here, ideally the agent should cancel all existing orders, needs code refactoring
-            # tocancel=[]
-            # for level, orders in self.positions[self.exchange.symbol].items():
-            #     if len(orders)>0:
-            #         for order in orders:
-            #             tocancel.append(order)
-            # self.exchange.autocancel(orders)
+            
             action=self.get_action()
             order=self.action_to_order(action)
             self.submitorder(order)
@@ -277,7 +272,7 @@ class TradingAgent(Entity):
                     self.positions[order.symbol][key]=[j for j in self.exchange.get_orders_from_level(level=key) if j.agent_id==self.id]
         else:
             raise TypeError(f"Unexpected message type: {type(message).__name__}")
-        if abs(self.cash)>self.cashlimit or abs(self.countInventory())>self.inventorylimit:
+        if self.truncation_enabled and (self.cash<0 or self.countInventory()<-1*self.inventorylimit or self.cash>self.cashlimit or self.countInventory()>self.inventorylimit):
             self.istruncated=True
         
     def wakeup(self, current_time: int, delay=0) -> None:
@@ -302,24 +297,13 @@ class TradingAgent(Entity):
         return sum([self.Inventory[j] for j in self.Inventory.keys()])     
     
     def reset(self) -> None:
-        #State attributes
-        self.profit=0
-        self.cash=self.startstate["cash"]
-        self.Inventory=self.startstate["Inventory"]
-        self.positions=self.positions={key: {} for key in self.Inventory.keys()} 
-        self.statelog=[(0, self.cash, self.profit, copy(self.startstate["Inventory"]), deepcopy(self.positions))] #List of [timecode, cash, #realized profit, inventory, positions]
-
-        ##Simulation attributes
-        self.exchange=None
-        self.istruncated=False
-        #What time does the agent think it is?
-        self.current_time: int = 0 
+        pass
 
     def updatestatelog(self):
         if self.statelog[-1][0]==self.current_time:
             logger.info(f"Last agent LOG is {self.statelog[-1]} and new log to be appended is {(self.current_time, self.cash, self.profit, self.Inventory.copy(), self.positions.copy())}")
             return False
-        self.statelog.append((self.current_time, self.cash, self.profit, copy(self.Inventory), deepcopy(self.positions)))
+        self.statelog.append((self.current_time, self.cash, self.profit, self.Inventory.copy(), self.positions.copy(), self.mid))
     
     def getobservations(self):
         rtn={"Cash":self.cash,
@@ -327,13 +311,15 @@ class TradingAgent(Entity):
              "Positions": self.positions[self.exchange.symbol]}
         return rtn
     
-
     @abstractmethod
     def get_action(self, data=None)-> str:
         pass
 
+    #extra function for dynamically assigned action_to_order implementation
+    def _mostCompetitiveOrder(self, side:str, positions:list):
+        return min(positions, key=lambda position:position.price) if side == "Ask" else max(positions, key=lambda position:position.price)
 
-class TradingAgent(TradingAgent):
+class CTradingAgent(TradingAgent):
 
     def _mostCompetitiveOrder(self, side:str, positions:list):
         return min(positions, key=lambda position:position.price) if side == "Ask" else max(positions, key=lambda position:position.price)
@@ -398,4 +384,5 @@ class TradingAgent(TradingAgent):
             price=np.round(price ,2)
             order=CancelOrder(time_placed=self.current_time, side=side, size=-1, symbol=self.exchange.symbol, agent_id=self.id,  price=price, cancelID=tocancel.order_id, _level=level)
         return order
-
+    
+TradingAgent.action_to_order = CTradingAgent.action_to_order

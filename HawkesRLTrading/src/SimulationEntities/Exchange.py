@@ -117,7 +117,7 @@ class Exchange(Entity):
                 self.bids[self.bidprices[k]]=queue
             else:
                 raise AssertionError(f"Level is not an ASK or BID string")
-        logger.debug("Stock Exchange initialized")
+        logger.debug("Stock Exchange initalized")
         #Send a message to agents to Tr trading
                 
     def generate_orders_in_queue(self, loblevel) -> List[LimitOrder]:
@@ -356,6 +356,7 @@ class Exchange(Entity):
                     logger.debug(f"\nItem size: {item.size}")
                     if remainingsize<item.size:
                         consumed=remainingsize
+                        self.marketvolume += consumed
                         totalvalue+=pricelvl*remainingsize
                         item.size=item.size-remainingsize
                         remainingsize=0
@@ -368,6 +369,7 @@ class Exchange(Entity):
                     else:
                         filled_order: Order=self.bids[pricelvl].pop(0)
                         remainingsize-=filled_order.size
+                        self.marketvolume += filled_order.size
                         totalvalue+=filled_order.size*pricelvl
                         filled_order.fill_time=self.current_time
                         filled_order.filled=True
@@ -402,6 +404,7 @@ class Exchange(Entity):
                     logger.debug(f"Remaining size: {remainingsize}, item size: {item.size}")
                     if remainingsize<item.size:
                         consumed=remainingsize
+                        self.marketvolume += consumed
                         item.size=item.size-remainingsize
                         totalvalue+=pricelvl*remainingsize
                         remainingsize=0
@@ -415,6 +418,7 @@ class Exchange(Entity):
                         filled_order: Order=self.asks[pricelvl].pop(0)
                         #print(f"Filled Order: {filled_order}")
                         remainingsize-=filled_order.size
+                        self.marketvolume += filled_order.size
                         totalvalue+=filled_order.size*pricelvl
                         #print(f"totalvalue: {totalvalue}")
                         filled_order.fill_time=self.current_time
@@ -501,10 +505,10 @@ class Exchange(Entity):
     
     def resolve_crossedorderbook(self):
         assert self.askprice==self.bidprice==self.askprices["Ask_L1"]==self.bidprices["Bid_L1"], f'Crossed Orderbook: ASKPRICE: {self.askprice}, BIDPRICE: {self.bidprice}, ASK_L1{self.askprices["Ask_L1"]}, BID_L1{self.bidprices["Bid_L1"]}'
-        #totalask1=sum([j.size for j in self.asks[self.askprices["Ask_L1"]]])
-        #totalbid1=sum([j.size for j in self.bids[self.bidprices["Bid_L1"]]])
-        ask_q=self.asks[self.askprices[self.askprice]]
-        bid_q=self.asks[self.bidprices[self.bidprice]]
+        totalask1=sum([j.size for j in self.asks[self.askprices["Ask_L1"]]])
+        totalbid1=sum([j.size for j in self.bids[self.bidprices["Bid_L1"]]])
+        ask_q=self.asks[self.askprices["Ask_L1"]]
+        bid_q=self.bids[self.bidprices['Bid_L1']]
         while len(ask_q)>0 and len(bid_q)>0:
             bid_order=bid_q[0]
             ask_order=ask_q[0]
@@ -631,7 +635,7 @@ class Exchange(Entity):
             rtn+=string
         return rtn
 
-    def returnlobl3sizes(self):
+    def returnlob(self):
         rtn= {}
         for i in range(self.LOBlevels, 0, -1):
             rtn[f"Ask_L{i}"] = (self.askprices[f'Ask_L{i}'],

@@ -1,5 +1,6 @@
+import copy
 from HawkesRLTrading.src.SimulationEntities.GymTradingAgent import GymTradingAgent
-from HJBQVI.DGMTorch import MLP, ActorCriticMLP, ActorCriticSGMLP
+from HJBQVI.DGMTorch import MLP, ActorCriticMLP, ActorCriticSGMLP, ActorCriticSeparate
 from HJBQVI.utils import MinMaxScaler
 from typing import Dict, Optional, Any
 import torch
@@ -7,8 +8,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-from collections import deque
+from collections import deque, defaultdict
 import random
+import gc
 
 def get_queue_priority(data, pos, label):
     ask_l1s = pos[label]
@@ -1287,12 +1289,117 @@ class ICRLSG(ICRL2):
         if self.last_action != 12:  # Only step u scheduler if action was taken
             self.scheduler_u.step()
 
+class StateActionVisitCounter:
+    def __init__(self, lambda_exploration=1.0):
+        """
+        Efficient state-action visit counter with fast exploration bonus computation.
+
+        Args:
+            lambda_exploration: Exploration bonus coefficient
+        """
+        self.lambda_exploration = lambda_exploration
+
+        # Use defaultdict for O(1) access and automatic initialization
+        self.visit_counts = defaultdict(int)
+
+        # Cache for sqrt calculations to avoid repeated computation
+        self.sqrt_cache = {}
+
+        # Pre-compute common sqrt values for better performance
+        self._precompute_common_sqrt_values()
+
+    def _precompute_common_sqrt_values(self, max_precompute=1000):
+        """Pre-compute sqrt values for first 1000 visit counts"""
+        for i in range(1, max_precompute + 1):
+            self.sqrt_cache[i] = np.sqrt(i)
+
+    def _state_to_key(self, state):
+        """
+        Convert state tuple to hashable key for dictionary lookup.
+        Handles floating point precision issues by rounding.
+
+        Args:
+            state: (inventory_intc, price_diff, n_a_over_q_a, n_b_over_q_b)
+        """
+        # Round to avoid floating point precision issues
+        return (
+            round(state[0], 0),  # inventory_intc
+            round(state[1], 2),  # p_a - p_b
+            round(state[2], 3),  # n_a/q_a
+            round(state[3], 3)   # n_b/q_b
+        )
+
+    def update_visit_count(self, state, action):
+        """
+        Increment visit count for state-action pair.
+
+        Args:
+            state: (inventory_intc, price_diff, n_a_over_q_a, n_b_over_q_b)
+            action: int from 0 to 12
+        """
+        key = (self._state_to_key(state), action)
+        self.visit_counts[key] += 1
+
+        # Update sqrt cache for this new count if not too large
+        new_count = self.visit_counts[key]
+        if new_count <= 10000 and new_count not in self.sqrt_cache:
+            self.sqrt_cache[new_count] = np.sqrt(new_count)
+
+    def get_visit_count(self, state, action):
+        """Get visit count for state-action pair (O(1) lookup)"""
+        key = (self._state_to_key(state), action)
+        return self.visit_counts[key]
+
+    def get_exploration_bonus(self, state, action):
+        """
+        Get exploration bonus lambda/sqrt(N(s,a)) with fast lookup.
+
+        Args:
+            state: (inventory_intc, price_diff, n_a_over_q_a, n_b_over_q_b)
+            action: int from 0 to 12
+
+        Returns:
+            float: Exploration bonus value
+        """
+        key = (self._state_to_key(state), action)
+        count = self.visit_counts[key]
+
+        if count == 0:
+            # First visit - return large bonus or handle as needed
+            return 0.2 #float('inf')  # or some large value like 1000
+
+        # Use cached sqrt if available, otherwise compute
+        if count in self.sqrt_cache:
+            sqrt_count = self.sqrt_cache[count]
+        else:
+            sqrt_count = np.sqrt(count)
+            # Cache if reasonable size
+            if count <= 10000:
+                self.sqrt_cache[count] = sqrt_count
+
+        return self.lambda_exploration / sqrt_count
+
+    def get_stats(self):
+        """Get statistics about the visit counter"""
+        total_states = len(set(key[0] for key in self.visit_counts.keys()))
+        total_sa_pairs = len(self.visit_counts)
+        total_visits = sum(self.visit_counts.values())
+
+        return {
+            'unique_states': total_states,
+            'unique_state_action_pairs': total_sa_pairs,
+            'total_visits': total_visits,
+            'cache_size': len(self.sqrt_cache)
+        }
+
 class PPOAgent(GymTradingAgent):
     def __init__(self, seed=1, log_events: bool = True, log_to_file: bool = False, strategy: str= "Random",
                  Inventory: Optional[Dict[str, Any]]=None, cash: int=5000, action_freq: float =0.5,
                  wake_on_MO: bool=True, wake_on_Spread: bool=True, cashlimit=1000000, inventorylimit=100,
                  buffer_capacity=10000, batch_size=64, epochs=1000, layer_widths = 128, n_layers = 3, clip_ratio=0.2,
-                 value_loss_coef=0.5, entropy_coef=10, max_grad_norm=0.5, gae_lambda=0.95, rewardpenalty = 0.1, hidden_activation='leaky_relu'):
+                 value_loss_coef=0.5, entropy_coef=10, max_grad_norm=0.5, gae_lambda=0.95, rewardpenalty = 0.1, hidden_activation='leaky_relu',
+                 transaction_cost = 0.01, start_trading_lag=0, truncation_enabled=True, action_space_config = 0, include_time = False, alt_state=False,
+                 policy_loss_coef = 1, optim_type = 'ADAM',lr=1e-3, exploration_bonus = 0, two_sided_reward = True):
         """
         PPO Agent with Generalized Advantage Estimation (GAE)
         Maintains two networks: one for decision (d) and one for utility (u)
@@ -1318,11 +1425,21 @@ class PPOAgent(GymTradingAgent):
         """
         super().__init__(seed=seed, log_events=log_events, log_to_file=log_to_file, strategy=strategy,
                          Inventory=Inventory, cash=cash, action_freq=action_freq, wake_on_MO=wake_on_MO,
-                         wake_on_Spread=wake_on_Spread, cashlimit=cashlimit, inventorylimit=inventorylimit)
+                         wake_on_Spread=wake_on_Spread, cashlimit=cashlimit, inventorylimit=inventorylimit, start_trading_lag=start_trading_lag,
+                         truncation_enabled=truncation_enabled)
 
         self.resetseed(seed)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+        #allowed actions:
+        if action_space_config == 0:
+            self.allowed_actions= ["lo_deep_Ask", "co_deep_Ask", "lo_top_Ask","co_top_Ask", "mo_Ask", "lo_inspread_Ask" ,
+                               "lo_inspread_Bid" , "mo_Bid", "co_top_Bid", "lo_top_Bid", "co_deep_Bid","lo_deep_Bid" ]
+            self.convert_dict = {}
+        elif action_space_config == 1:
+            self.allowed_actions= ["lo_top_Ask","co_top_Ask","co_top_Bid", "lo_top_Bid" ]
+            self.convert_dict = {0:2, 1:3, 2:8, 3:9}
+        self.include_time = include_time
+        self.alt_state = alt_state
         # PPO Hyperparameters
         self.epochs = epochs
         self.batch_size = batch_size
@@ -1331,19 +1448,23 @@ class PPOAgent(GymTradingAgent):
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.gae_lambda = gae_lambda
-
+        self.policy_loss_coef = policy_loss_coef
         # Training parameters
         self.layer_widths = layer_widths
         self.n_layers = n_layers
         self.hidden_activation = hidden_activation
-        self.lr = 1e-3
+        self.lr = lr
         self.gamma = 0.99  # discount factor
         self.rewardpenalty = rewardpenalty  # inventory penalty
         self.last_state, self.last_action = None, None
+        self.transaction_cost = transaction_cost
+        self.optim = optim_type
         # Trajectory storage
         self.trajectory_buffer = []
         self.buffer_capacity = buffer_capacity
-
+        self.exploration_bonus = bool(exploration_bonus)
+        self.visit_counter = StateActionVisitCounter(lambda_exploration=exploration_bonus)
+        self.two_sided_reward = two_sided_reward
         # State scaler
         self.mmscaler = MinMaxScaler()
 
@@ -1357,6 +1478,7 @@ class PPOAgent(GymTradingAgent):
         :param data: Input trading data
         :return: Processed state tensor
         """
+        time = data['current_time']
         p_a, q_a = data['LOB0']['Ask_L1']
         p_b, q_b = data['LOB0']['Bid_L1']
         self.mid = 0.5*(p_a + p_b)
@@ -1372,7 +1494,12 @@ class PPOAgent(GymTradingAgent):
         n_a, n_b = np.min(n_as), np.min(n_bs)
         lambdas = data['current_intensity']
         past_times = data['past_times']
-        state = torch.tensor([[self.cash, self.Inventory['INTC'], p_a, p_b, q_a, q_b, qD_a, qD_b, n_a, n_b, (p_a + p_b)*0.5] + list(lambdas.flatten()) + list(past_times.flatten())], dtype=torch.float32).to(self.device)
+        if self.include_time:
+            state = torch.tensor([[time, self.Inventory['INTC'], p_a, p_b, q_a, q_b, qD_a, qD_b, n_a, n_b, (p_a + p_b)*0.5] + list(lambdas.flatten()) + list(past_times.flatten())], dtype=torch.float32).to(self.device)
+        elif self.alt_state:
+            state = torch.tensor([[time, self.Inventory['INTC'], p_a - p_b, n_a/q_a, n_b/q_b] + list(lambdas.flatten()/np.sum(lambdas.flatten())) + list(past_times.flatten())], dtype=torch.float32).to(self.device)
+        else:
+            state = torch.tensor([[ self.Inventory['INTC'], p_a, p_b, q_a, q_b, qD_a, qD_b, n_a, n_b, (p_a + p_b)*0.5] + list(lambdas.flatten()) + list(past_times.flatten())], dtype=torch.float32).to(self.device)
         return state
 
     def getState(self, state):
@@ -1385,13 +1512,13 @@ class PPOAgent(GymTradingAgent):
         if type(state) == dict:
             state = self.readData(state)
 
-        # Scaling the state
-        if len(self.trajectory_buffer) > 10:
-            states = torch.cat([torch.cat([tr[1][0] for tr in self.trajectory_buffer])])
-            self.mmscaler.fit(states)
-            state = self.mmscaler.transform(state)
-        else:
-            state = self.mmscaler.fit_transform(state)
+        # # Scaling the state
+        # if len(self.trajectory_buffer) > 10:
+        #     states = torch.cat([torch.cat([tr[1][0] for tr in self.trajectory_buffer])])
+        #     self.mmscaler.fit(states)
+        #     state = self.mmscaler.transform(state)
+        # else:
+        #     state = self.mmscaler.fit_transform(state)
 
         return state
 
@@ -1399,16 +1526,18 @@ class PPOAgent(GymTradingAgent):
         def lr_lambda(epoch):
             # Learning rate schedule
             x =1
-            if epoch > 500:
-                x= 1e-1
-            # x = x*np.max([1e-1,(1e-1)**(epoch//5000)])
+            # if epoch > 500:
+            #     x= 1e-1
+            # x = x*np.max([1e-1,(.5)**(epoch//5000)])
             return x
-
-        optimizer = optim.Adam(net.parameters(), lr=self.lr, weight_decay=1e-3)
+        if self.optim == 'SGD':
+            optimizer = optim.SGD(net.parameters(), lr=self.lr)
+        else:
+            optimizer = optim.Adam(net.parameters(), lr = self.lr)
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         return optimizer, scheduler
 
-    def setupNNs(self, data0):
+    def setupNNs(self, data0 ,type='separate'):
         """
         Setup neural networks for PPO with two networks (d and u)
 
@@ -1419,8 +1548,12 @@ class PPOAgent(GymTradingAgent):
         state_dim = len(data0[0])
 
         # Initialize main networks with shared architecture
-        self.Actor_Critic_d = ActorCriticMLP(state_dim, self.layer_widths, self.n_layers, 2, actor_activation='tanh', hidden_activation=self.hidden_activation, q_function = False)
-        self.Actor_Critic_u = ActorCriticMLP(state_dim, self.layer_widths, self.n_layers, 12, actor_activation='tanh', hidden_activation=self.hidden_activation,q_function = False)
+        if type == 'separate':
+            self.Actor_Critic_d = ActorCriticSeparate(state_dim, self.layer_widths, self.n_layers, 2, actor_activation=None, hidden_activation=self.hidden_activation, q_function = False)
+            self.Actor_Critic_u = ActorCriticSeparate(state_dim, self.layer_widths, self.n_layers, len(self.allowed_actions), actor_activation=None, hidden_activation=self.hidden_activation,q_function = False)
+        else:
+            self.Actor_Critic_d = ActorCriticMLP(state_dim, self.layer_widths, self.n_layers, 2, actor_activation='tanh', hidden_activation=self.hidden_activation, q_function = False)
+            self.Actor_Critic_u = ActorCriticMLP(state_dim, self.layer_widths, self.n_layers, len(self.allowed_actions), actor_activation='tanh', hidden_activation=self.hidden_activation,q_function = False)
 
         # Move all models to appropriate device
         self.Actor_Critic_d.to(self.device)
@@ -1430,21 +1563,36 @@ class PPOAgent(GymTradingAgent):
         self.optimizer_d, self.scheduler_d = self.setupTraining(self.Actor_Critic_d)
         self.optimizer_u, self.scheduler_u = self.setupTraining(self.Actor_Critic_u)
 
+    def get_weights(self):
+        return {'d':self.Actor_Critic_d.state_dict(), 'u':self.Actor_Critic_u.state_dict()}
+
+    def update_weights(self, new_weights):
+        self.Actor_Critic_d.load_state_dict(new_weights['d'])
+        self.Actor_Critic_u.load_state_dict(new_weights['u'])
+        return 0
+
+
     def calculaterewards(self, termination) -> Any:
         penalty = self.rewardpenalty * (self.countInventory()**2)
         self.profit = self.cash - self.statelog[0][1]
         self.updatestatelog()
         deltaPNL = self.statelog[-1][2] - self.statelog[-2][2]
-        deltaInv = self.statelog[-1][3]['INTC']*self.statelog[-1][-1] - self.statelog[-2][3]['INTC']*self.statelog[-2][-1]
+        deltaInv = self.statelog[-1][3]['INTC']*self.statelog[-1][-1]*(1- self.transaction_cost*np.sign(self.statelog[-1][3]['INTC'])) - self.statelog[-2][3]['INTC']*self.statelog[-2][-1]*(1-self.transaction_cost*np.sign(self.statelog[-1][3]['INTC']))
         # if self.istruncated or termination:
         #     deltaPNL += self.countInventory() * self.mid
         # reward shaping
         if self.istruncated:
             penalty += 100
         if self.last_action != 12:
-            penalty -= 10 # custom reward for incentivising actions rather than inaction for learning
-        if (self.last_state.cpu().numpy()[0][8] < self.last_state.cpu().numpy()[0][4] + self.last_state.cpu().numpy()[0][6]) and (self.last_state.cpu().numpy()[0][9] < self.last_state.cpu().numpy()[0][5] + self.last_state.cpu().numpy()[0][7]):
-            penalty -= 20 # custom reward for double sided quoting
+            penalty -= self.rewardpenalty *10 # custom reward for incentivising actions rather than inaction for learning
+        if (not self.alt_state) and (self.last_state.cpu().numpy()[0][8] < self.last_state.cpu().numpy()[0][4] + self.last_state.cpu().numpy()[0][6]) and (self.last_state.cpu().numpy()[0][9] < self.last_state.cpu().numpy()[0][5] + self.last_state.cpu().numpy()[0][7]):
+            penalty -= self.rewardpenalty *20 # custom reward for double sided quoting
+        if self.alt_state:
+            if self.two_sided_reward:
+                if (self.last_state.cpu().numpy()[0][3] <= 1) and (self.last_state.cpu().numpy()[0][4] <= 1):
+                    penalty -= self.rewardpenalty *20 # custom reward for double sided quoting
+            if self.exploration_bonus:
+                penalty -= self.visit_counter.get_exploration_bonus(self.last_state.cpu().numpy()[0][1:5], self.last_action)
         return deltaPNL + deltaInv - penalty
 
     def get_action(self, data, epsilon=0.1):
@@ -1462,15 +1610,16 @@ class PPOAgent(GymTradingAgent):
         if (random.random() < epsilon) or (len(self.trajectory_buffer) < 10):
             # Random decision
             d = random.randint(0, 1)
-            u = random.randint(0, 11)
-
+            u = random.randint(0, len(self.allowed_actions) - 1)
+            _u = copy.deepcopy(u)
+            u = self.convert_dict.get(u, u)
             # Compute dummy logits for logging
             d_logits, d_value = self.Actor_Critic_d(state)
             u_logits, u_value = self.Actor_Critic_u(state)
 
             # Get log probabilities
             d_log_prob = torch.log_softmax(d_logits, dim=1)[0, d]
-            u_log_prob = torch.log_softmax(u_logits, dim=1)[0, u]
+            u_log_prob = torch.log_softmax(u_logits, dim=1)[0, _u]
 
             # Validation checks (similar to original implementation)
             if int(u) in [1, 3, 8, 10]:  # cancels
@@ -1487,12 +1636,12 @@ class PPOAgent(GymTradingAgent):
                     self.last_action = 12
                     return 12, (d, 0), d_log_prob.item(), 0, d_value.item(), 0
 
-            if (int(u) == 4) and (self.countInventory() < 1):  # ask mo
+            if (int(u) == 4) and (self.countInventory() < 1):  # ask mo -> since it hits the bid
                 self.last_action = 12
                 return 12, (d, 0), d_log_prob.item(), 0, d_value.item(), 0
 
             self.last_action = u
-            return u, (d, u), d_log_prob.item(), u_log_prob.item(), d_value.item(), u_value.item()
+            return u, (d, _u), d_log_prob.item(), u_log_prob.item(), d_value.item(), u_value.item()
 
         # Exploitation
         with torch.no_grad():
@@ -1511,9 +1660,17 @@ class PPOAgent(GymTradingAgent):
             u_logits, u_value = self.Actor_Critic_u(state)
             u_probs = torch.softmax(u_logits, dim=1).squeeze()
             u = torch.multinomial(u_probs, 1).item()
-            u_log_prob = torch.log(u_probs[u])
+            _u = copy.deepcopy(u)
+            u = self.convert_dict.get(u, u)
 
-            # Validation checks (similar to original implementation)
+            # Validation checks
+            if np.abs(self.countInventory()) >= self.inventorylimit -1: # cancel top orders if at inventory limit
+                if self.countInventory() < 0:
+                    u = 3
+                elif self.countInventory() > 0:
+                    u = 8
+            u_log_prob = torch.log(u_probs[_u])
+
             if int(u) in [1, 3, 8, 10]:  # cancels
                 a = self.actions[int(u)]
                 lvl = self.actionsToLevels[a]
@@ -1528,11 +1685,16 @@ class PPOAgent(GymTradingAgent):
                     self.last_action = 12
                     return 12, (d, 0), d_log_prob.item(), 0, d_value.item(), 0
 
-            if (int(u) == 4) and (self.countInventory() < 1):  # ask mo
+            if (int(u) == 4) and ((self.countInventory() < 1) or (self.countInventory() >= self.inventorylimit - 2)):  # ask mo -> hits the bid
                 self.last_action = 12
                 return 12, (d, 0), d_log_prob.item(), 0, d_value.item(), 0
+
+            if (int(u)==7) and (self.countInventory() <= 2 - self.inventorylimit): # bid mo
+                self.last_action = 12
+                return 12, (d, 0), d_log_prob.item(), 0, d_value.item(), 0
+
             self.last_action = u
-            return u, (d, u), d_log_prob.item(), u_log_prob.item(), d_value.item(), u_value.item()
+            return u, (d, _u), d_log_prob.item(), u_log_prob.item(), d_value.item(), u_value.item()
 
     def store_transition(self, ep, state, action, reward, next_state, done):
         """
@@ -1557,6 +1719,8 @@ class PPOAgent(GymTradingAgent):
             int(done)         # Done flag
         )
         self.trajectory_buffer.append((ep, transition))
+        if self.exploration_bonus:
+            self.visit_counter.update_visit_count(self.last_state.cpu().numpy()[0][1:5], self.last_action)
 
     def compute_gae(self, rewards, values_d, values_u, dones):
         """
@@ -1609,7 +1773,7 @@ class PPOAgent(GymTradingAgent):
         # returns_u = (returns_u - returns_u.mean()) / (returns_u.std() + 1e-8)
         return advantages_d, returns_d, advantages_u, returns_u
 
-    def train(self, train_logger):
+    def train(self, train_logger, use_CEM = False):
         """
         PPO training method using entire episode trajectory
         """
@@ -1648,22 +1812,32 @@ class PPOAgent(GymTradingAgent):
             tmp_buffer.append([states, d_actions, u_actions, d_logits_old, values_d_old, d_log_probs_old, u_logits_old, values_u_old, u_log_probs_old, advantages_d, returns_d, advantages_u, returns_u])
         _states, _d_actions, _u_actions, _d_logits_old, _values_d_old, _d_log_probs_old, _u_logits_old, _values_u_old, _u_log_probs_old, _advantages_d, _returns_d, _advantages_u, _returns_u = [torch.cat([element[i] for element in tmp_buffer]) for i in range(len(tmp_buffer[0]))]
         del tmp_buffer
+        if use_CEM:
+            cem_states_d, cem_d_actions = self.get_CEM_data(type='d')
+            cem_states_u, cem_u_actions = self.get_CEM_data(type='u')
         # PPO training for multiple epochs
+        # idxs =np.random.choice(np.arange(len(_states)), self.batch_size)
         for _ in range(self.epochs):
             idxs =np.random.choice(np.arange(len(_states)), self.batch_size)
             states, d_actions, u_actions, d_logits_old, values_d_old, d_log_probs_old, u_logits_old, values_u_old, u_log_probs_old, advantages_d, returns_d, advantages_u, returns_u = _states[idxs,:], _d_actions[idxs], _u_actions[idxs], _d_logits_old[idxs,:], _values_d_old[idxs,:], _d_log_probs_old[idxs], _u_logits_old[idxs,:], _values_u_old[idxs,:], _u_log_probs_old[idxs], _advantages_d[idxs], _returns_d[idxs], _advantages_u[idxs], _returns_u[idxs]
             # Decision Network Training
             # Current policy output
             d_logits, d_values_pred = self.Actor_Critic_d(states)
-            d_log_probs = F.log_softmax(d_logits, dim=1).gather(1, d_actions.unsqueeze(1)).squeeze()
+            if use_CEM:
+                idxs =np.random.choice(np.arange(len(cem_states_d)), self.batch_size)
+                d_logits, _ = self.Actor_Critic_d(torch.cat(cem_states_d)[idxs,:])
+                d_policy_loss = F.cross_entropy(d_logits, torch.tensor(cem_d_actions)[idxs].to(self.device))
 
-            # Compute ratios
-            d_ratios = torch.exp(d_log_probs - d_log_probs_old)
+            else:
+                d_log_probs = F.log_softmax(d_logits, dim=1).gather(1, d_actions.unsqueeze(1)).squeeze()
 
-            # PPO Clipped Objective for Decision Network
-            d_surr1 = d_ratios * advantages_d
-            d_surr2 = torch.clamp(d_ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_d
-            d_policy_loss = -torch.min(d_surr1, d_surr2).mean()
+                # Compute ratios
+                d_ratios = torch.exp(d_log_probs - d_log_probs_old)
+
+                # PPO Clipped Objective for Decision Network
+                d_surr1 = d_ratios * advantages_d
+                d_surr2 = torch.clamp(d_ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_d
+                d_policy_loss = -torch.min(d_surr1, d_surr2).mean()
 
             # Value loss for Decision Network
             # d_values_pred, _ = self.Critic_d(states)
@@ -1673,7 +1847,7 @@ class PPOAgent(GymTradingAgent):
             d_entropy_loss = -(torch.softmax(d_logits, dim=1) * F.log_softmax(d_logits, dim=1)).sum(dim=1).mean()
 
             # Total Decision Network Loss
-            d_loss = (d_policy_loss +
+            d_loss = (self.policy_loss_coef*d_policy_loss +
                       self.value_loss_coef * d_value_loss -
                       self.entropy_coef * d_entropy_loss)
 
@@ -1696,15 +1870,20 @@ class PPOAgent(GymTradingAgent):
 
                 # Current policy output
                 u_logits, u_values_pred = self.Actor_Critic_u(states_u)
-                u_log_probs = F.log_softmax(u_logits, dim=1).gather(1, u_actions_u.unsqueeze(1)).squeeze()
+                if use_CEM:
+                    idxs =np.random.choice(np.arange(len(cem_states_u)), self.batch_size)
+                    u_logits, _ = self.Actor_Critic_u(torch.cat(cem_states_u)[idxs,:])
+                    u_policy_loss = F.cross_entropy(u_logits, torch.tensor(cem_u_actions)[idxs].to(self.device))
+                else:
+                    u_log_probs = F.log_softmax(u_logits, dim=1).gather(1, u_actions_u.unsqueeze(1)).squeeze()
 
-                # Compute ratios
-                u_ratios = torch.exp(u_log_probs - u_log_probs_old_filtered)
+                    # Compute ratios
+                    u_ratios = torch.exp(u_log_probs - u_log_probs_old_filtered)
 
-                # PPO Clipped Objective for Utility Network
-                u_surr1 = u_ratios * advantages_u_filtered
-                u_surr2 = torch.clamp(u_ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_u_filtered
-                u_policy_loss = -torch.min(u_surr1, u_surr2).mean()
+                    # PPO Clipped Objective for Utility Network
+                    u_surr1 = u_ratios * advantages_u_filtered
+                    u_surr2 = torch.clamp(u_ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_u_filtered
+                    u_policy_loss = -torch.min(u_surr1, u_surr2).mean()
 
                 u_value_loss = F.mse_loss(u_values_pred.squeeze(), returns_u_filtered)
 
@@ -1748,5 +1927,109 @@ class PPOAgent(GymTradingAgent):
             eID = self.trajectory_buffer[0][0]
             end_idx = np.max([i for i in range(len(self.trajectory_buffer)) if self.trajectory_buffer[i][0] == eID]) + 1
             self.trajectory_buffer = self.trajectory_buffer[end_idx:]
+            gc.collect()
         # return d_policy_loss.item(), d_value_loss.item(), d_entropy_loss.item(), u_policy_loss.item(), u_value_loss.item(), u_entropy_loss.item()
         return [0]*6
+
+    def get_max_contiguous_rewards(self, K):
+        """
+        Find maximum contiguous subarray of rewards for each episode with minimum length K
+
+        :param K: Minimum length of subarray
+        :return: Dictionary mapping episode -> (start_idx, end_idx, max_sum)
+                 where indices are relative to the episode's trajectory
+        """
+        if not self.trajectory_buffer:
+            return {}
+
+        # Group trajectories by episode
+        episodes = {}
+        for ep, transition in self.trajectory_buffer:
+            if ep not in episodes:
+                episodes[ep] = []
+            episodes[ep].append(transition)
+
+        results = {}
+
+        for ep, transitions in episodes.items():
+            if len(transitions) < K:
+                # Episode too short for minimum length K
+                results[ep] = None
+                continue
+
+            rewards = [t[3] for t in transitions]  # Extract rewards (index 3 in transition tuple)
+
+            max_sum = float('-inf')
+            best_start = 0
+            best_end = K - 1
+
+            # Check all possible subarrays of length >= K
+            for start in range(len(rewards) - K + 1):
+                current_sum = sum(rewards[start:start + K])  # Initial window of size K
+
+                # Check if this K-length window is better
+                if current_sum > max_sum:
+                    max_sum = current_sum
+                    best_start = start
+                    best_end = start + K - 1
+
+                # Extend the window beyond K if possible
+                for end in range(start + K, len(rewards)):
+                    current_sum += rewards[end]
+                    if current_sum > max_sum:
+                        max_sum = current_sum
+                        best_start = start
+                        best_end = end
+
+            results[ep] = (best_start, best_end, max_sum)
+
+        return results
+
+    def get_subarray_data(self, episode, start_idx, end_idx):
+        """
+        Helper method to extract state, d, u data for a given episode and index range
+
+        :param episode: Episode number
+        :param start_idx: Start index (inclusive)
+        :param end_idx: End index (inclusive)
+        :return: List of (state, d, u) tuples for the specified range
+        """
+        episode_data = []
+        for ep, transition in self.trajectory_buffer:
+            if ep == episode:
+                episode_data.append(transition)
+
+        if start_idx < 0 or end_idx >= len(episode_data) or start_idx > end_idx:
+            return []
+
+        result = []
+        for i in range(start_idx, end_idx + 1):
+            state, d, u, reward, next_state, done = episode_data[i]
+            result.append((state, d, u))
+
+        return result
+
+    def get_CEM_data(self, type='d'):
+        states = []
+        actions = []
+        results = self.get_max_contiguous_rewards(K=10)
+
+        for episode, result in results.items():
+            if result is not None:
+                start_idx, end_idx, max_sum = result
+                print(f"Episode {episode}: indices {start_idx}-{end_idx}, sum={max_sum}")
+
+                # Get the corresponding state, d, u data
+                subarray_data = self.get_subarray_data(episode, start_idx, end_idx)
+                if type=='d':
+                    for s, d, u in subarray_data:
+                        states.append(s)
+                        actions.append(d)
+                else:
+                    for s, d, u in subarray_data:
+                        states.append(s)
+                        actions.append(u)
+            else:
+                print(f"Episode {episode}: too short (< K steps)")
+
+        return states, actions

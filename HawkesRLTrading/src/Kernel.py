@@ -39,10 +39,11 @@ class Kernel:
     Note that the simulation timefloor is in microseconds
     
     """
-    def __init__(self, agents: List[TradingAgent], exchange: Exchange, seed: int=1, stop_time: int=100, wall_time_limit: int=600, log_to_file: bool=True, **parameters) -> None:
+    def __init__(self, agents: List[TradingAgent], exchange: Exchange, seed: int=1, kernel_name: str="Alpha", stop_time: int=100, wall_time_limit: int=600, log_to_file: bool=True, **parameters) -> None:
+        self.kernel_name=kernel_name
         self.agents: List[TradingAgent]=agents
         self.gymagents= [agent for agent in self.agents if isinstance(agent, GymTradingAgent)]
-        assert len(self.gymagents)==1, f"This Kernel is currently incompatible with more than one Gym Agent"
+        # assert len(self.gymagents)==1, f"This Kernel is currently incompatible with more than one Gym Agent"
         assert len(agents)>0, f"Number of agents must be more than 0" 
         self.exchange: Exchange=exchange
         assert exchange, f"Expected a valid exchange but received None"
@@ -65,7 +66,7 @@ class Kernel:
         self.wall_time_limit=wall_time_limit #in seconds
         self.isrunning=False
         #The simulation times of the different entities, used to keep track of whose turn it is
-        self.nearest_action_time=0
+        self.nearest_action_time= 0
         self.agents_current_times: Dict[int, any] ={j.id: self.start_time for j in self.agents}
         self.agents_action_freq: Dict[int, float]={j.id: j.action_freq for j in self.agents} #time between each action for each agent
         #Implementation of message queue
@@ -74,6 +75,7 @@ class Kernel:
         self.head=0 #Kernel Message counter
         self.parameters={k: v for k, v in parameters.items()}
         self.WakeUpDelay = parameters.get("WakeUpDelay", 0) # this is the agent wake-up delay
+
 
     def getparameter(self, name):
         try:
@@ -328,10 +330,13 @@ class Kernel:
             elif isinstance(message, WakeAgentMsg):
                 #Message sent to agents to tell them to start trading
                 if not self.isrunning: return None
+
                 assert self.agents_current_times[recipientID]>=timesent, f"Agent registry time: {self.agents_current_times[recipientID]}. Timesent: {timesent}"
                 if recipientID==-1 or recipientID==self.exchange.id:
                     raise UnexpectedMessageType("WakeAgent Messages should be sent to a valid agentID")
                 agent: TradingAgent=self.entity_registry[recipientID]
+                if hasattr(agent, 'first_wakeup_time'):
+                    if self.current_time < agent.first_wakeup_time: return {recipientID: None}
                 if isinstance(agent, GymTradingAgent):
                     #Interrupt the process and 
                     # if isinstance(message, TradeNotificationMsg) and not agent.wake_on_MO:
@@ -445,7 +450,7 @@ class Kernel:
                 logger.debug(f"Agent {agentID} wake-up time set to {requested_time}")
                 return True
             else:
-                raise KeyError(f"Agent {agentID} is valid but is not registered in Kernel registry")
+                raise KeyError(f"Agent {agentID} is valid but is not registered in Kernel {self.kernel_name} registry")
             
         else:
             raise KeyError(f"No agent exists with ID {agentID}")       
@@ -456,8 +461,8 @@ class Kernel:
 
         if self.current_time==self.agents_current_times[agentID]:
             agent=self.entity_registry[agentID]
-            self.current_time+= self.WakeUpDelay
-            agent.wakeup(self.current_time, delay=self.WakeUpDelay)
+            self.current_time+= self.WakeUpDelay 
+            agent.wakeup(self.current_time, delay=self.WakeUpDelay) 
             
         else:
             logger.info(f"Kernel time {self.current_time} does not match Agent {agentID} intended wake-up time {self.agents_current_times[agentID]}")
@@ -495,10 +500,13 @@ class Kernel:
     def isterminated(self):
         return self.current_time>=self.stop_time
     
-    def getobservations(self, agentID: int):
+    def getobservations(self, agentID: int=1):
         rtn={"LOB0": self.exchange.lob0,
         }
-        agent=self.entity_registry[agentID]
+        try:
+            agent=self.entity_registry[agentID]
+        except KeyError:
+            return None
         agentobs=agent.getobservations()
         rtn["Cash"]=agentobs["Cash"]
         rtn["Inventory"]=agentobs["Inventory"]
@@ -509,6 +517,7 @@ class Kernel:
         pt = self.current_time - self.entity_registry[self.exchange.id].returnpasteventimes()
         pt[pt==self.current_time+1] = -1
         rtn['past_times']= pt
+        rtn['current_time'] = self.current_time
         return rtn
     
     def getinfo(self, data: Dict={}):
